@@ -6,6 +6,9 @@ from providers.anthropic_adapter import AnthropicProvider
 from models.registry import registry
 from router.prompt_optimizer import optimize_prompt
 from router.complexity_analyzer import analyze_complexity
+from tracker.database import initialize_database
+from tracker.logger import log_request
+from tracker.budget import check_budget
 
 load_dotenv()
 
@@ -13,10 +16,16 @@ app = FastAPI(
     title="LLM Cost Optimizer",
     description=(
         "Routes LLM requests to the cheapest capable Claude model. "
-        "Optimizes prompts before sending to reduce token usage."
+        "Tracks cost per team and enforces budget limits."
     ),
-    version="2.0.0"
+    version="3.0.0"
 )
+
+# -----------------------------------------------------------------------
+# Initialize the database when the server starts.
+# Creates tables if they don't exist. Safe to run every time.
+# -----------------------------------------------------------------------
+initialize_database()
 
 anthropic_provider = AnthropicProvider()
 
@@ -27,71 +36,42 @@ def _route_request(
     preferred_model: str | None
 ) -> dict:
     """
-    The smart routing function. Replaces the simple priority mapping.
+    Optimize the prompt and route to the right model tier.
 
-    Two-step process:
-        Step 1 — Prompt Optimization
-            Clean the prompt before anything else.
-            Fewer tokens = lower cost regardless of which model is chosen.
-
-        Step 2 — Complexity Analysis
-            Read the cleaned prompt and score its complexity.
-            Use that score to pick the right model tier.
-
-    Priority still matters:
-        "high"   → always use Tier 3, skip analysis
-        "medium" → analyze, but never go below Tier 2
-        "low"    → analyze freely, use cheapest that fits
-
-    preferred_model overrides everything.
+    Step 1: Optimize prompt (remove filler, normalize whitespace)
+    Step 2: Analyze complexity (score prompt → pick tier)
+    Step 3: Return model name + cleaned prompt + routing info
 
     Args:
-        prompt         : The raw prompt from the user.
+        prompt         : Raw prompt from the user.
         priority       : "low", "medium", or "high".
         preferred_model: Optional direct model override.
 
     Returns:
-        dict: {
-            "model_name"      : str,   the chosen model
-            "optimized_prompt": str,   cleaned prompt to send
-            "routing_reason"  : str,   why this model was chosen
-            "tokens_saved"    : int,   tokens removed by optimizer
-            "percent_saved"   : float  percentage saved
-        }
+        dict with model_name, optimized_prompt, routing_reason,
+        tokens_saved, percent_saved.
     """
-
-    # -------------------------------------------------------------------
-    # STEP 1: Optimize the prompt
-    # Always do this first, regardless of routing outcome.
-    # Even if the user specifies a preferred model, we still clean
-    # the prompt — because fewer tokens always means lower cost.
-    # -------------------------------------------------------------------
+    # Step 1: Always optimize first
     optimization = optimize_prompt(prompt)
     optimized_prompt = optimization["optimized_prompt"]
     tokens_saved = optimization["tokens_saved"]
     percent_saved = optimization["percent_saved"]
 
-    # -------------------------------------------------------------------
-    # OVERRIDE: User specified a model directly
-    # Skip all routing logic. Use their choice. Still use clean prompt.
-    # -------------------------------------------------------------------
+    # User override — skip routing logic
     if preferred_model:
         return {
             "model_name": preferred_model,
             "optimized_prompt": optimized_prompt,
             "routing_reason": (
                 f"User-specified model: {preferred_model}. "
-                f"Prompt optimized: {tokens_saved} tokens saved "
-                f"({percent_saved}%)."
+                f"Prompt optimized: {tokens_saved} tokens saved ({percent_saved}%)."
             ),
             "tokens_saved": tokens_saved,
-            "percent_saved": percent_saved
+            "percent_saved": percent_saved,
+            "original_prompt": prompt
         }
 
-    # -------------------------------------------------------------------
-    # HIGH PRIORITY: Always use best model
-    # No need to analyze — correctness matters most here.
-    # -------------------------------------------------------------------
+    # High priority → always best model
     if priority == "high":
         tier_models = registry.get_by_tier(3)
         return {
@@ -99,33 +79,22 @@ def _route_request(
             "optimized_prompt": optimized_prompt,
             "routing_reason": (
                 f"Priority 'high' → Tier 3 (best model). "
-                f"Prompt optimized: {tokens_saved} tokens saved "
-                f"({percent_saved}%)."
+                f"Prompt optimized: {tokens_saved} tokens saved ({percent_saved}%)."
             ),
             "tokens_saved": tokens_saved,
-            "percent_saved": percent_saved
+            "percent_saved": percent_saved,
+            "original_prompt": prompt
         }
 
-    # -------------------------------------------------------------------
-    # STEP 2: Analyze complexity of the cleaned prompt
-    # -------------------------------------------------------------------
+    # Step 2: Analyze complexity of the cleaned prompt
     analysis = analyze_complexity(optimized_prompt)
     analyzed_tier = analysis["tier"]
 
-    # -------------------------------------------------------------------
-    # FLOOR RULE: Never route below what the user's priority implies
-    #
-    # Example: User says "medium" (implies at least Tier 2).
-    # Analyzer says Tier 1. We use Tier 2 — never under-serve.
-    #
-    # But if analyzer says Tier 3 and user said "medium",
-    # we use Tier 3 — never ignore a complexity signal upward.
-    # -------------------------------------------------------------------
+    # Never route below the user's stated priority floor
     priority_floor = {"low": 1, "medium": 2}
     min_tier = priority_floor.get(priority, 1)
     final_tier = max(analyzed_tier, min_tier)
 
-    # Get model for the final tier
     tier_models = registry.get_by_tier(final_tier)
     if not tier_models:
         raise ValueError(f"No models found for tier {final_tier}")
@@ -133,43 +102,53 @@ def _route_request(
     return {
         "model_name": tier_models[0].name,
         "optimized_prompt": optimized_prompt,
-        "routing_reason": analysis["reason"] + (
-            f" Prompt optimized: {tokens_saved} tokens saved "
-            f"({percent_saved}%)."
+        "routing_reason": (
+            analysis["reason"] +
+            f" Prompt optimized: {tokens_saved} tokens saved ({percent_saved}%)."
         ),
         "tokens_saved": tokens_saved,
-        "percent_saved": percent_saved
+        "percent_saved": percent_saved,
+        "original_prompt": prompt
     }
 
 
 @app.post("/llm/request", response_model=LLMResponse)
 async def process_request(req: LLMRequest) -> LLMResponse:
     """
-    Main endpoint. Optimizes prompt, routes to best model, returns response.
-
-    Example request body:
-    {
-        "prompt": "Could you please analyze the financial risks of expanding into Europe?",
-        "team_id": "strategy",
-        "feature_name": "risk_analysis",
-        "priority": "low"
-    }
-
-    What happens:
-        1. Optimizer removes "Could you please" → saves tokens
-        2. Analyzer sees "analyze" + "financial" → risk override → Tier 3
-        3. Claude Opus answers the question
-        4. Response includes routing_reason, tokens_saved, cost
+    Main endpoint. Full flow:
+        1. Check team budget → block if over limit
+        2. Optimize prompt → fewer tokens = lower cost
+        3. Analyze complexity → pick right model
+        4. Call Claude
+        5. Log everything to database
+        6. Return response
     """
     try:
-        # Route the request (optimize + analyze + pick model)
+        # -----------------------------------------------------------
+        # STEP 1: Budget check BEFORE calling Claude
+        # If blocked, we return an error immediately.
+        # Claude is never called. No cost is incurred.
+        # -----------------------------------------------------------
+        budget_status = check_budget(req.team_id, req.priority)
+
+        if budget_status["status"] == "blocked":
+            raise HTTPException(
+                status_code=429,
+                detail=budget_status["message"]
+            )
+
+        # -----------------------------------------------------------
+        # STEP 2 + 3: Route the request (optimize + analyze)
+        # -----------------------------------------------------------
         routing = _route_request(
             prompt=req.prompt,
             priority=req.priority,
             preferred_model=req.preferred_model
         )
 
-        # Call Claude with the OPTIMIZED prompt
+        # -----------------------------------------------------------
+        # STEP 4: Call Claude with the optimized prompt
+        # -----------------------------------------------------------
         response = anthropic_provider.call(
             model_name=routing["model_name"],
             prompt=routing["optimized_prompt"],
@@ -180,14 +159,94 @@ async def process_request(req: LLMRequest) -> LLMResponse:
             }
         )
 
+        # -----------------------------------------------------------
+        # STEP 5: Log the request to the database
+        # We do this AFTER getting the response so we have real
+        # token counts and cost from Anthropic (not estimates).
+        # If logging fails, we still return the response — the user
+        # already got their answer.
+        # -----------------------------------------------------------
+        log_request(
+            team_id=req.team_id,
+            feature_name=req.feature_name,
+            model_used=response.model_used,
+            tokens_input=response.tokens_input,
+            tokens_output=response.tokens_output,
+            cost=response.cost,
+            latency_ms=response.latency_ms,
+            routing_reason=response.routing_reason,
+            tokens_saved=response.tokens_saved,
+            percent_saved=response.percent_saved,
+            original_prompt=routing.get("original_prompt", ""),
+            optimized_prompt=routing["optimized_prompt"]
+        )
+
+        # -----------------------------------------------------------
+        # STEP 6: Add budget warning to response if applicable
+        # The response still goes through — just with a note attached
+        # -----------------------------------------------------------
+        if budget_status["status"] == "warning":
+            response.routing_reason = (
+                response.routing_reason +
+                f" | {budget_status['message']}"
+            )
+
         return response
 
+    except HTTPException:
+        # Re-raise HTTP exceptions (budget blocked, etc.)
+        raise
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except RuntimeError as e:
         raise HTTPException(status_code=502, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Unexpected error: {str(e)}")
+
+
+@app.get("/spend/{team_id}")
+def get_team_spend_endpoint(team_id: str):
+    """
+    Returns how much a team has spent today and this month.
+
+    Visit http://localhost:8000/spend/marketing to check marketing's spend.
+
+    Args:
+        team_id: The team name in the URL path.
+    """
+    from tracker.logger import get_team_spend
+    from tracker.budget import get_team_budget
+
+    spend = get_team_spend(team_id)
+    budget = get_team_budget(team_id)
+
+    return {
+        "team_id": team_id,
+        "daily_spend": spend["daily_spend"],
+        "daily_limit": budget["daily_limit"],
+        "daily_percent_used": round(
+            spend["daily_spend"] / budget["daily_limit"] * 100, 1
+        ),
+        "monthly_spend": spend["monthly_spend"],
+        "monthly_limit": budget["monthly_limit"],
+        "monthly_percent_used": round(
+            spend["monthly_spend"] / budget["monthly_limit"] * 100, 1
+        )
+    }
+
+
+@app.get("/spend")
+def get_all_spend():
+    """
+    Returns spend breakdown by team and by model.
+    Used by the dashboard in Phase 4.
+    """
+    from tracker.logger import get_spend_by_team, get_spend_by_model
+
+    return {
+        "by_team": get_spend_by_team(),
+        "by_model": get_spend_by_model()
+    }
 
 
 @app.get("/models")
@@ -211,7 +270,7 @@ def health_check():
     return {
         "status": "ok",
         "service": "LLM Cost Optimizer",
-        "version": "2.0.0"
+        "version": "3.0.0"
     }
 
 
