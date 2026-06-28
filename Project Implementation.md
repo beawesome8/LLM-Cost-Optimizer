@@ -202,21 +202,6 @@ The savings number is the headline metric for your portfolio case study.
 
 ---
 
-### Phase 5 — Portfolio Polish (Day 5)
-
-**Goal:** Make the project presentable on GitHub and in interviews.
-
-**What you build:**
-- Simulated workload script: send 50 mixed prompts through the gateway
-  and generate a cost savings report
-- Final README with architecture diagram, setup instructions,
-  example requests, and the case study headline metric
-- GitHub push with clean commit history
-
-**Result:** A project you can demo live in any interview and explain end to end.
-
----
-
 ## Setup Instructions
 
 ### 1. Clone the Repository
